@@ -1,0 +1,72 @@
+spring:
+  application:
+    name: polymarket-okx-arb
+
+  datasource:
+    url: jdbc:mysql://localhost:3306/arb_db?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 10000
+      idle-timeout: 300000
+
+  jpa:
+    hibernate:
+      ddl-auto: update          # 首次运行自动建表，生产改 validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+    open-in-view: false
+
+# 数据采集配置
+collector:
+  polymarket:
+    ws-url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    rest-url: https://clob.polymarket.com
+    max-markets: 50
+    keyword-filter: bitcoin,btc,ethereum,eth,price,above,below
+    refresh-interval-seconds: 300    # 市场列表刷新间隔
+    reconnect-delay-ms: 3000         # 断线重连延迟
+
+  okx:
+    ws-url: wss://ws.okx.com:8443/ws/v5/public
+    rest-url: https://www.okx.com/api/v5
+    underlyings: BTC,ETH,SOL
+    max-dte: 60
+    greeks-poll-interval-seconds: 10
+    reconnect-delay-ms: 3000
+
+  chain:
+    polygon-ws-url: ${POLYGON_WS_URL:}
+    polygon-rpc-url: ${POLYGON_RPC_URL:}
+    enabled: false   # 先关闭，Phase 2 开启
+
+# 风控参数
+risk:
+  max-single-position-usd: 5000
+  max-total-exposure-usd: 50000
+  max-drawdown-pct: 0.15
+  daily-loss-limit-usd: 3000
+
+# Spring 管理端口
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.arb: INFO
+    org.hibernate.SQL: WARN

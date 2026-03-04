@@ -1,0 +1,318 @@
+package com.arb.collector;
+
+import com.arb.cache.MarketDataCache;
+import com.arb.config.CollectorProperties;
+import com.arb.event.MarketEventPublisher;
+import com.arb.model.MarketDataEvent;
+import com.arb.model.PolyTicker;
+import com.arb.repository.PolyTickerRepository;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Polymarket 行情采集器
+ *
+ * 1. @PostConstruct 启动时：REST 拉取活跃市场列表
+ * 2. WebSocket 订阅实时行情（自动重连）
+ * 3. @Scheduled 定时刷新市场列表，补订新市场
+ * 4. 行情更新 → 写缓存 → 异步落库 → 发布事件
+ */
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class PolymarketCollector {
+
+    private static final String REST_URL = "https://clob.polymarket.com";
+
+    private final OkHttpClient            httpClient;
+    private final ObjectMapper            objectMapper;
+    private final MarketDataCache         cache;
+    private final MarketEventPublisher    publisher;
+    private final PolyTickerRepository    repository;
+    private final CollectorProperties     props;
+
+    private final AtomicBoolean           running  = new AtomicBoolean(false);
+    private final AtomicReference<WebSocket> wsRef = new AtomicReference<>();
+
+    /** 已订阅的 condition_id 集合 */
+    private final Set<String> subscribedIds = ConcurrentHashMap.newKeySet();
+
+    // ─── 生命周期 ─────────────────────────────────────────────────
+
+    @PostConstruct
+    @Async("collectorExecutor")
+    public void start() {
+        running.set(true);
+        log.info("Polymarket 采集器启动");
+        connectWebSocket();
+        refreshMarkets();   // 首次立即拉取
+    }
+
+    @PreDestroy
+    public void stop() {
+        running.set(false);
+        WebSocket ws = wsRef.get();
+        if (ws != null) ws.close(1000, "shutdown");
+        log.info("Polymarket 采集器已停止");
+    }
+
+    // ─── WebSocket ────────────────────────────────────────────────
+
+    private void connectWebSocket() {
+        if (!running.get()) return;
+
+        Request request = new Request.Builder()
+            .url(props.getPolymarket().getWsUrl())
+            .build();
+
+        httpClient.newWebSocket(request, new WebSocketListener() {
+
+            @Override
+            public void onOpen(WebSocket ws, Response response) {
+                wsRef.set(ws);
+                log.info("Polymarket WS 已连接");
+                // 重连后重新订阅已知市场
+                if (!subscribedIds.isEmpty()) {
+                    subscribe(ws, new ArrayList<>(subscribedIds));
+                }
+            }
+
+            @Override
+            public void onMessage(WebSocket ws, String text) {
+                handleMessage(text);
+            }
+
+            @Override
+            public void onFailure(WebSocket ws, Throwable t, Response response) {
+                wsRef.set(null);
+                log.warn("Polymarket WS 断开: {}, {}ms 后重连", t.getMessage(),
+                    props.getPolymarket().getReconnectDelayMs());
+                if (running.get()) {
+                    scheduleReconnect();
+                }
+            }
+
+            @Override
+            public void onClosed(WebSocket ws, int code, String reason) {
+                wsRef.set(null);
+                log.info("Polymarket WS 关闭: code={} reason={}", code, reason);
+                if (running.get()) {
+                    scheduleReconnect();
+                }
+            }
+        });
+    }
+
+    private void scheduleReconnect() {
+        try {
+            Thread.sleep(props.getPolymarket().getReconnectDelayMs());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        connectWebSocket();
+    }
+
+    private void subscribe(WebSocket ws, List<String> conditionIds) {
+        try {
+            Map<String, Object> msg = Map.of(
+                "type",    "subscribe",
+                "channel", "live_activity",
+                "markets", conditionIds
+            );
+            ws.send(objectMapper.writeValueAsString(msg));
+            subscribedIds.addAll(conditionIds);
+            log.info("Polymarket WS 订阅 {} 个市场", conditionIds.size());
+        } catch (Exception e) {
+            log.error("订阅失败: {}", e.getMessage());
+        }
+    }
+
+    // ─── 消息处理 ─────────────────────────────────────────────────
+
+    private void handleMessage(String raw) {
+        try {
+            JsonNode root = objectMapper.readTree(raw);
+
+            // 有时返回数组
+            if (root.isArray()) {
+                for (JsonNode node : root) processNode(node);
+            } else {
+                processNode(root);
+            }
+        } catch (Exception e) {
+            log.error("消息解析异常: {} | raw={}", e.getMessage(), raw.length() > 200 ? raw.substring(0, 200) : raw);
+        }
+    }
+
+    private void processNode(JsonNode node) {
+        String eventType = node.path("event_type").asText(node.path("type").asText(""));
+        switch (eventType) {
+            case "price_change" -> onPriceChange(node);
+            case "book"         -> { /* 订单簿快照，暂跳过 */ }
+            default             -> log.debug("未知 Poly 事件: {}", eventType);
+        }
+    }
+
+    private void onPriceChange(JsonNode msg) {
+        String marketId = msg.path("asset_id").asText(msg.path("condition_id").asText(""));
+        if (marketId.isEmpty()) return;
+
+        JsonNode changes = msg.has("changes") ? msg.get("changes") : objectMapper.createArrayNode().add(msg);
+
+        for (JsonNode change : changes) {
+            String outcome = change.path("outcome").asText("yes").equalsIgnoreCase("yes") ? "YES" : "NO";
+            String side    = change.path("side").asText("");
+            BigDecimal price = toBD(change.path("price").asText("0"));
+
+            // 从缓存取已有数据做增量更新
+            Optional<PolyTicker> existing = cache.getPolyTicker(marketId, outcome);
+            BigDecimal bestBid = existing.map(PolyTicker::getBestBid).orElse(BigDecimal.ZERO);
+            BigDecimal bestAsk = existing.map(PolyTicker::getBestAsk).orElse(BigDecimal.ONE);
+
+            if ("BUY".equals(side))  bestBid = price;
+            if ("SELL".equals(side)) bestAsk = price;
+
+            BigDecimal mid    = bestBid.add(bestAsk).divide(BigDecimal.valueOf(2), 6, RoundingMode.HALF_UP);
+            BigDecimal spread = bestAsk.subtract(bestBid);
+
+            PolyTicker ticker = PolyTicker.builder()
+                .marketId(marketId)
+                .eventTitle(msg.path("market").asText(""))
+                .outcome(outcome)
+                .bestBid(bestBid)
+                .bestAsk(bestAsk)
+                .lastPrice(price)
+                .midPrice(mid)
+                .spread(spread)
+                .volume24h(toBD(msg.path("volume").asText("0")))
+                .liquidity(toBD(msg.path("liquidity").asText("0")))
+                .expireTime(parseDateTime(msg.path("end_date_iso").asText("")))
+                .status("ACTIVE")
+                .ts(LocalDateTime.now())
+                .build();
+
+            // 写缓存
+            cache.putPolyTicker(ticker);
+
+            // 异步落库
+            saveAsync(ticker);
+
+            // 发布事件
+            publisher.publish(MarketDataEvent.of(MarketDataEvent.Source.POLYMARKET, ticker));
+        }
+    }
+
+    // ─── REST：市场列表刷新 ────────────────────────────────────────
+
+    /** 每 5 分钟刷新一次活跃市场，补订新市场 */
+    @Scheduled(fixedRateString = "${collector.polymarket.refresh-interval-seconds:300}000",
+               initialDelay = 60000)
+    public void refreshMarkets() {
+        log.info("刷新 Polymarket 市场列表...");
+        try {
+            List<String> newIds = fetchActiveMarketIds();
+            Set<String> toSubscribe = new HashSet<>(newIds);
+            toSubscribe.removeAll(subscribedIds);
+
+            if (!toSubscribe.isEmpty()) {
+                WebSocket ws = wsRef.get();
+                if (ws != null) {
+                    subscribe(ws, new ArrayList<>(toSubscribe));
+                }
+            }
+            log.info("Polymarket 活跃市场: 总数={}, 新增订阅={}", newIds.size(), toSubscribe.size());
+        } catch (Exception e) {
+            log.error("市场列表刷新失败: {}", e.getMessage());
+        }
+    }
+
+    private List<String> fetchActiveMarketIds() throws Exception {
+        List<String> ids   = new ArrayList<>();
+        String nextCursor  = null;
+        List<String> keywords = props.getPolymarket().getKeywords();
+        int maxMarkets = props.getPolymarket().getMaxMarkets();
+
+        do {
+            HttpUrl.Builder urlBuilder = HttpUrl.parse(REST_URL + "/markets").newBuilder()
+                .addQueryParameter("active", "true")
+                .addQueryParameter("closed", "false")
+                .addQueryParameter("limit", "100");
+            if (nextCursor != null) urlBuilder.addQueryParameter("next_cursor", nextCursor);
+
+            Request req = new Request.Builder().url(urlBuilder.build()).build();
+            try (Response resp = httpClient.newCall(req).execute()) {
+                if (!resp.isSuccessful() || resp.body() == null) break;
+                JsonNode data = objectMapper.readTree(resp.body().string());
+
+                for (JsonNode market : data.path("data")) {
+                    String title = (market.path("question").asText("") + " " +
+                                   market.path("description").asText("")).toLowerCase();
+                    boolean match = keywords.stream().anyMatch(title::contains);
+                    if (match) {
+                        ids.add(market.path("condition_id").asText(""));
+                    }
+                }
+                nextCursor = data.path("next_cursor").asText(null);
+            }
+        } while (nextCursor != null && !nextCursor.isEmpty() && ids.size() < maxMarkets);
+
+        return ids.stream().filter(s -> !s.isEmpty()).distinct().limit(maxMarkets).toList();
+    }
+
+    // ─── 异步落库 ─────────────────────────────────────────────────
+
+    @Async("collectorExecutor")
+    public void saveAsync(PolyTicker ticker) {
+        try {
+            repository.save(ticker);
+        } catch (Exception e) {
+            log.error("PolyTicker 落库失败: {}", e.getMessage());
+        }
+    }
+
+    // ─── 工具方法 ─────────────────────────────────────────────────
+
+    private BigDecimal toBD(String s) {
+        try {
+            return new BigDecimal(s);
+        } catch (Exception e) {
+            return BigDecimal.ZERO;
+        }
+    }
+
+    private LocalDateTime parseDateTime(String s) {
+        if (s == null || s.isEmpty()) return null;
+        try {
+            return LocalDateTime.parse(s.replace("Z", ""), DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // ─── 状态查询 ─────────────────────────────────────────────────
+
+    public boolean isConnected() {
+        return wsRef.get() != null;
+    }
+
+    public int getSubscribedCount() {
+        return subscribedIds.size();
+    }
+}
