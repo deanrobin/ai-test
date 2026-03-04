@@ -1,0 +1,48 @@
+# config.example.yaml - 复制为 config.yaml 并填入真实值
+
+# ─── 基础设施 ─────────────────────────────────────────────────────
+redis_url: "redis://localhost:6379/0"
+
+# ─── Polygon 链上 ─────────────────────────────────────────────────
+polygon_ws_url:  "wss://polygon-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+polygon_rpc_url: "https://polygon-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+
+# ─── OKX API（执行层用，数据观测层不需要）──────────────────────────
+okx_api_key:    "YOUR_OKX_API_KEY"
+okx_secret:     "YOUR_OKX_SECRET"
+okx_passphrase: "YOUR_OKX_PASSPHRASE"
+
+# ─── Polymarket ───────────────────────────────────────────────────
+poly_max_markets: 50
+poly_keyword_filter:
+  - "bitcoin"
+  - "btc"
+  - "ethereum"
+  - "eth"
+  - "price"
+  - "above"
+  - "below"
+# poly_market_filter:  # 指定 condition_id 白名单（优先级高于 keyword_filter）
+#   - "0xabc..."
+
+# ─── OKX 采集 ────────────────────────────────────────────────────
+okx_underlyings:
+  - BTC
+  - ETH
+okx_max_dte: 60      # 只追踪 60 天内到期的期权
+
+# ─── 策略参数 ────────────────────────────────────────────────────
+arb_spread_threshold: 0.05      # 套利触发价差（5%）
+min_liquidity_usd: 1000
+hedge_rebalance_threshold: 0.10
+
+# ─── 风控 ────────────────────────────────────────────────────────
+max_single_position_usd: 5000
+max_total_exposure_usd: 50000
+max_drawdown_pct: 0.15
+daily_loss_limit_usd: 3000
+stop_loss_pct: 0.10
+take_profit_pct: 0.05
+
+# ─── 通知 ────────────────────────────────────────────────────────
+telegram_chat_id: "YOUR_CHAT_ID"
