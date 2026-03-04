@@ -58,6 +58,9 @@ public class OkxCollector {
         running.set(true);
         log.info("OKX 采集器启动");
         connectWebSocket();
+        // 启动后立刻 REST 拉取一次，不等 initialDelay
+        try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
+        pollGreeks();
     }
 
     @PreDestroy
@@ -123,9 +126,9 @@ public class OkxCollector {
             args.add(Map.of("channel", "tickers", "instId", udl + "-USDT"));
         }
 
-        // 期权摘要（含 Greeks）- 按标的订阅
+        // 期权摘要（含 Greeks）- 按 instFamily 订阅（uly 已废弃）
         for (String udl : props.getOkx().getUnderlyingList()) {
-            args.add(Map.of("channel", "opt-summary", "uly", udl + "-USD"));
+            args.add(Map.of("channel", "opt-summary", "instFamily", udl + "-USD"));
         }
 
         try {
@@ -181,8 +184,11 @@ public class OkxCollector {
 
         LocalDate expiry;
         try {
-            expiry = LocalDate.parse(expiryStr, DateTimeFormatter.BASIC_ISO_DATE);
+            // OKX 日期格式：260327 = YYMMDD，需补全为 20YYMMDD
+            String fullDateStr = expiryStr.length() == 6 ? "20" + expiryStr : expiryStr;
+            expiry = LocalDate.parse(fullDateStr, DateTimeFormatter.BASIC_ISO_DATE);
         } catch (Exception e) {
+            log.warn("日期解析失败: instId={} expiryStr={}", iid, expiryStr);
             return;
         }
 
@@ -190,15 +196,22 @@ public class OkxCollector {
         BigDecimal spotPrice = cache.getSpotPrice(underlying)
             .orElse(toBD(item.path("fwdPx").asText("0")));
 
-        BigDecimal bid = toBD(item.path("bidPx").asText("0"));
-        BigDecimal ask = toBD(item.path("askPx").asText("0"));
-        BigDecimal mid = (bid.add(ask)).divide(BigDecimal.valueOf(2), 8, java.math.RoundingMode.HALF_UP);
+        // opt-summary 没有 bid/ask price，用 markVol 作为 mid（IV 曲面价格）
+        // bid/ask 的 IV 是 bidVol/askVol
+        BigDecimal bidVol = toBD(item.path("bidVol").asText("0"));
+        BigDecimal askVol = toBD(item.path("askVol").asText("0"));
+        BigDecimal markVol = toBD(item.path("markVol").asText("0"));
 
-        // IV: OKX 返回的是百分比形式
-        BigDecimal ivRaw = toBD(item.path("vol").asText("0"));
-        BigDecimal iv = ivRaw.compareTo(BigDecimal.ZERO) > 0
-            ? ivRaw.divide(BigDecimal.valueOf(100), 6, java.math.RoundingMode.HALF_UP)
-            : BigDecimal.ZERO;
+        // opt-summary 返回的价格实际上是 IV（波动率），不是期权价格
+        // bid/ask 用 bidVol/askVol 近似表示
+        BigDecimal bid = bidVol;
+        BigDecimal ask = askVol;
+        BigDecimal mid = (bid.add(ask)).compareTo(BigDecimal.ZERO) > 0
+            ? bid.add(ask).divide(BigDecimal.valueOf(2), 8, java.math.RoundingMode.HALF_UP)
+            : markVol;
+
+        // IV 直接用 markVol（已经是小数形式，如 0.65 = 65%）
+        BigDecimal iv = markVol;
 
         OkxOptionTicker ticker = OkxOptionTicker.builder()
             .instrumentId(iid)
@@ -265,7 +278,7 @@ public class OkxCollector {
     private void pollGreeksByUnderlying(String underlying) throws Exception {
         HttpUrl url = HttpUrl.parse(props.getOkx().getRestUrl() + "/public/opt-summary")
             .newBuilder()
-            .addQueryParameter("uly", underlying + "-USD")
+            .addQueryParameter("instFamily", underlying + "-USD")
             .build();
 
         Request req = new Request.Builder().url(url).build();

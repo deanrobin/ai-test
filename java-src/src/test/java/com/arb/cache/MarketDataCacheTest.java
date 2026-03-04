@@ -66,13 +66,16 @@ class MarketDataCacheTest {
 
     @Test
     void findMatchingCall_returnsClosestStrike() {
-        // 放入几个期权
+        // 到期日设为 30 天后，DTE ≈ 30
+        LocalDate expiry = LocalDate.now().plusDays(30);
+        String expiryStr = expiry.format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE);
+
         for (int strike : new int[]{90000, 95000, 100000, 105000}) {
             OkxOptionTicker opt = OkxOptionTicker.builder()
-                .instrumentId("BTC-20261231-" + strike + "-C")
+                .instrumentId("BTC-" + expiryStr + "-" + strike + "-C")
                 .underlying("BTC")
                 .strike(new BigDecimal(strike))
-                .expiry(LocalDate.of(2026, 12, 31))
+                .expiry(expiry)
                 .optionType("C")
                 .bestBid(new BigDecimal("0.01"))
                 .bestAsk(new BigDecimal("0.02"))
@@ -81,16 +84,17 @@ class MarketDataCacheTest {
             cache.putOkxOption(opt);
         }
 
+        // targetDteDays=30，maxDteDiff=7 → DTE≈30 全部通过
         Optional<OkxOptionTicker> match = cache.findMatchingCall(
             "BTC",
             new BigDecimal("98000"),  // 目标 strike
-            90L,                       // 目标 DTE
-            0.10,                      // 10% 偏差
-            30L                        // DTE 偏差 30 天
+            30L,                       // 目标 DTE（与上面一致）
+            0.10,                      // 10% strike 偏差
+            7L                         // DTE 偏差 7 天
         );
 
         assertThat(match).isPresent();
-        // 最近的 strike 是 100000（偏差 2.04%）
+        // 最近 strike：95000（偏差 3.06%）或 100000（偏差 2.04%），应选 100000
         assertThat(match.get().getStrike()).isEqualByComparingTo("100000");
     }
 

@@ -3,9 +3,9 @@ spring:
     name: polymarket-okx-arb
 
   datasource:
-    url: jdbc:mysql://localhost:3306/arb_db?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8
-    username: ${DB_USERNAME:root}
-    password: ${DB_PASSWORD:}
+    url: jdbc:mysql://localhost:33066/arb_db?useSSL=false&serverTimezone=UTC&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+    username: ${DB_USERNAME:arb}
+    password: ${DB_PASSWORD:arb123456}
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       maximum-pool-size: 10
@@ -36,7 +36,7 @@ collector:
   okx:
     ws-url: wss://ws.okx.com:8443/ws/v5/public
     rest-url: https://www.okx.com/api/v5
-    underlyings: BTC,ETH,SOL
+    underlyings: BTC,ETH
     max-dte: 60
     greeks-poll-interval-seconds: 10
     reconnect-delay-ms: 3000
