@@ -1,3 +1,15 @@
 target/
 *.class
 *.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 本地配置（含敏感信息，绝不提交）
+.env
+application-local.yml
+application-local.yaml
+application-prod.yml
+application-prod.yaml
